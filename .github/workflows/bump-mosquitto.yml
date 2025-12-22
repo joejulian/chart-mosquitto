@@ -161,7 +161,7 @@ jobs:
       - name: Open or update PR (and label)
         if: steps.decide.outputs.bump == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PR_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -172,13 +172,11 @@ jobs:
           title="chore(chart): bump mosquitto to ${latest}"
           body=$'Automated bump from upstream tags.\n\n- appVersion: '"${latest}"$'\n- chart version: '"${latest}"$'\n'
 
-          # Create PR if missing; otherwise update title/body
           if gh pr view "${branch}" >/dev/null 2>&1; then
             gh pr edit "${branch}" --title "${title}" --body "${body}" || true
           else
             gh pr create --head "${branch}" --base main --title "${title}" --body "${body}"
           fi
 
-          # Ensure label exists before adding (ignore errors if it already exists / cannot create)
           gh label create "${PR_LABEL}" --color "0366d6" --description "Automated dependency updates" >/dev/null 2>&1 || true
           gh pr edit "${branch}" --add-label "${PR_LABEL}" || true
