@@ -1,4 +1,4 @@
-name: Publish Helm chart to GHCR
+name: Publish Helm chart to GHCR (if missing)
 
 on:
   push:
@@ -25,49 +25,63 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect chart version change
-        id: changed
-        shell: bash
-        run: |
-          set -euo pipefail
-          before="${{ github.event.before }}"
-          after="${{ github.sha }}"
-
-          if [[ "$before" =~ ^0+$ ]]; then
-            echo "version_changed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if git diff "$before" "$after" -- "${CHART_DIR}/Chart.yaml" | grep -qE '^[+-]version:\s'; then
-            echo "version_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "version_changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Set up Helm
-        if: steps.changed.outputs.version_changed == 'true'
         uses: azure/setup-helm@v4
         with:
           version: v3.15.4
 
-      - name: Log in to GHCR for cosign (Docker creds)
-        if: steps.changed.outputs.version_changed == 'true'
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.3
+
+      - name: Log in to GHCR for Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ github.token }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Log in to GHCR for cosign/crane (Docker creds)
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Install crane
-        if: steps.changed.outputs.version_changed == 'true'
-        uses: imjasonh/setup-crane@v0.3
+      - name: Compute chart ref
+        id: ref
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Install cosign
-        if: steps.changed.outputs.version_changed == 'true'
-        uses: sigstore/cosign-installer@v3
+          name="$(awk -F': ' '$1=="name"{print $2; exit}' "${CHART_DIR}/Chart.yaml" | tr -d '"' | tr -d "'")"
+          ver="$(awk -F': ' '$1=="version"{print $2; exit}' "${CHART_DIR}/Chart.yaml" | tr -d '"' | tr -d "'")"
+
+          dest="${GHCR_DEST#oci://}"
+          ref="${dest}/${name}:${ver}"
+
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this chart version is already published
+        id: exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ steps.ref.outputs.ref }}"
+
+          if crane manifest "$ref" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Already published: $ref"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Not published yet: $ref"
+          fi
 
       - name: Package chart
-        if: steps.changed.outputs.version_changed == 'true'
+        if: steps.exists.outputs.exists == 'false'
         shell: bash
         run: |
           set -euo pipefail
@@ -75,42 +89,20 @@ jobs:
           helm package "${CHART_DIR}" --destination dist
           ls -la dist
 
-      - name: Login to GHCR (Helm OCI)
-        if: steps.changed.outputs.version_changed == 'true'
+      - name: Push chart to GHCR (OCI)
+        if: steps.exists.outputs.exists == 'false'
         shell: bash
         run: |
           set -euo pipefail
-          echo "${{ github.token }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Push chart to GHCR
-        if: steps.changed.outputs.version_changed == 'true'
-        id: push
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          tgz="$(ls -1 dist/*.tgz | head -n1)"
-          helm push "$tgz" "${GHCR_DEST}"
-
-          # Compute chart name + version from Chart.yaml
-          name="$(awk -F': ' '$1=="name"{print $2; exit}' "${CHART_DIR}/Chart.yaml" | tr -d '"' | tr -d "'")"
-          ver="$(awk -F': ' '$1=="version"{print $2; exit}' "${CHART_DIR}/Chart.yaml" | tr -d '"' | tr -d "'")"
-
-          # Convert oci://... -> <registry>/<repo>
-          dest="${GHCR_DEST#oci://}"
-          ref="${dest}/${name}:${ver}"
-
-          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
-          echo "Pushed ${ref}"
+          helm push dist/*.tgz "${GHCR_DEST}"
+          echo "Pushed ${{ steps.ref.outputs.ref }}"
 
       - name: Cosign sign (keyless, by digest)
-        if: steps.changed.outputs.version_changed == 'true'
+        if: steps.exists.outputs.exists == 'false'
         shell: bash
         run: |
           set -euo pipefail
-
-          ref="${{ steps.push.outputs.ref }}"
+          ref="${{ steps.ref.outputs.ref }}"
           digest="$(crane digest "$ref")"
           digref="${ref%@*}@${digest}"
-
           cosign sign --yes "$digref"
