@@ -1,0 +1,105 @@
+name: Publish Helm chart to GHCR
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write # required for keyless cosign via GitHub OIDC
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      CHART_DIR: chart
+      GHCR_DEST: oci://ghcr.io/joejulian/charts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect chart version change
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          before="${{ github.event.before }}"
+          after="${{ github.sha }}"
+
+          if [[ "$before" =~ ^0+$ ]]; then
+            echo "version_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git diff "$before" "$after" -- "${CHART_DIR}/Chart.yaml" | grep -qE '^[+-]version:\s'; then
+            echo "version_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Helm
+        if: steps.changed.outputs.version_changed == 'true'
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.4
+
+      - name: Install cosign
+        if: steps.changed.outputs.version_changed == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Package chart
+        if: steps.changed.outputs.version_changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm lint "${CHART_DIR}"
+          helm package "${CHART_DIR}" --destination dist
+          ls -la dist
+
+      - name: Login to GHCR (Helm OCI)
+        if: steps.changed.outputs.version_changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ github.token }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push chart to GHCR
+        if: steps.changed.outputs.version_changed == 'true'
+        id: push
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tgz="$(ls -1 dist/*.tgz | head -n1)"
+          helm push "$tgz" "${GHCR_DEST}"
+
+          # Compute chart name + version from Chart.yaml
+          name="$(awk -F': ' '$1=="name"{print $2; exit}' "${CHART_DIR}/Chart.yaml" | tr -d '"' | tr -d "'")"
+          ver="$(awk -F': ' '$1=="version"{print $2; exit}' "${CHART_DIR}/Chart.yaml" | tr -d '"' | tr -d "'")"
+
+          # Convert oci://... -> <registry>/<repo>
+          dest="${GHCR_DEST#oci://}"
+          ref="${dest}/${name}:${ver}"
+
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${ref}"
+
+      - name: Cosign sign (keyless) the pushed chart
+        if: steps.changed.outputs.version_changed == 'true'
+        shell: bash
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          set -euo pipefail
+
+          ref="${{ steps.push.outputs.ref }}"
+
+          # Sign by digest (cosign will resolve and record signature in the registry)
+          cosign sign --yes "${ref}"

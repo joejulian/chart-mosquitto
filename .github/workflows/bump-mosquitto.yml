@@ -1,0 +1,136 @@
+name: Bump Mosquitto + Chart version
+
+on:
+  schedule:
+    - cron: "17 9 * * *" # daily; UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bump-mosquitto
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    env:
+      CHART_DIR: chart
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ruamel.yaml
+
+      - name: Determine latest Mosquitto release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          latest_tag="$(
+            gh api repos/eclipse-mosquitto/mosquitto/releases/latest \
+              --jq '.tag_name'
+          )"
+
+          latest_ver="${latest_tag#v}"
+
+          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+          echo "latest_ver=$latest_ver" >> "$GITHUB_OUTPUT"
+
+      - name: Update Chart.yaml (appVersion + chart version bump)
+        id: update
+        env:
+          LATEST_APP: ${{ steps.rel.outputs.latest_ver }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os, re, sys
+          from ruamel.yaml import YAML
+
+          chart_dir = os.environ["CHART_DIR"]
+          chart_path = f"{chart_dir}/Chart.yaml"
+          latest_app = os.environ["LATEST_APP"].strip()
+
+          semver_re = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+          def parse_semver(s: str):
+            m = semver_re.match(s)
+            if not m:
+              raise SystemExit(f"Not a plain semver X.Y.Z: {s!r}")
+            return tuple(int(x) for x in m.groups())
+
+          yaml = YAML()
+          yaml.preserve_quotes = True
+
+          with open(chart_path, "r", encoding="utf-8") as f:
+            data = yaml.load(f)
+
+          cur_app = str(data.get("appVersion", "")).strip()
+          cur_chart = str(data.get("version", "")).strip()
+
+          cur_app_t = parse_semver(cur_app)
+          latest_app_t = parse_semver(latest_app)
+          cur_chart_t = parse_semver(cur_chart)
+
+          if latest_app_t == cur_app_t:
+            print("NOOP: appVersion already latest")
+            return
+
+          cur_app_major, cur_app_minor, cur_app_patch = cur_app_t
+          lat_major, lat_minor, lat_patch = latest_app_t
+
+          if lat_major != cur_app_major:
+            raise SystemExit(
+              f"Mosquitto MAJOR changed {cur_app_major} -> {lat_major}; refusing to auto-bump chart."
+            )
+
+          chart_major, chart_minor, chart_patch = cur_chart_t
+
+          if lat_minor == cur_app_minor and lat_patch > cur_app_patch:
+            # app patch bump => chart patch +1
+            chart_patch += 1
+          elif lat_minor > cur_app_minor:
+            # app minor bump => chart minor +1, reset patch
+            chart_minor += 1
+            chart_patch = 0
+          else:
+            # latest is older or weird; do nothing
+            print(f"NOOP: latest ({latest_app}) <= current ({cur_app})")
+            return
+
+          data["appVersion"] = latest_app
+          data["version"] = f"{chart_major}.{chart_minor}.{chart_patch}"
+
+          with open(chart_path, "w", encoding="utf-8") as f:
+            yaml.dump(data, f)
+
+          print(f"Updated appVersion: {cur_app} -> {latest_app}")
+          print(f"Updated chart version: {cur_chart} -> {data['version']}")
+          PY
+
+          if git diff --quiet -- "${CHART_DIR}/Chart.yaml"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${CHART_DIR}/Chart.yaml"
+          git commit -m "chore(mosquitto): bump appVersion and chart version"
+          git push origin HEAD:main
