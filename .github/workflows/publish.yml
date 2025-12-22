@@ -3,6 +3,7 @@ name: Publish Helm chart to GHCR (if missing) + Ensure signed
 on:
   push:
     branches: ["main"]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -94,12 +95,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           ref="${{ steps.ref.outputs.ref }}"
           digest="$(crane digest "$ref")"
           digref="${ref%%@*}@${digest}"
-
           echo "digref=$digref" >> "$GITHUB_OUTPUT"
+
+      - name: Verify signature
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          digref="${{ steps.digest.outputs.digref }}"
+
+          if cosign verify \
+              --certificate-oidc-issuer "${COSIGN_OIDC_ISSUER}" \
+              --certificate-identity "${COSIGN_IDENTITY}" \
+              "$digref" >/dev/null 2>&1; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Cosign sign (keyless)
         if: steps.verify.outputs.signed == 'false'
@@ -107,3 +122,12 @@ jobs:
         run: |
           set -euo pipefail
           cosign sign --yes "${{ steps.digest.outputs.digref }}"
+
+      - name: Verify signature (must succeed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-oidc-issuer "${COSIGN_OIDC_ISSUER}" \
+            --certificate-identity "${COSIGN_IDENTITY}" \
+            "${{ steps.digest.outputs.digref }}" >/dev/null
