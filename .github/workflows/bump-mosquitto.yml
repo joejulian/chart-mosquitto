@@ -1,13 +1,9 @@
-name: Bump Mosquitto version (Chart.yaml) + open/update PR
+name: Bump Mosquitto appVersion and chart version
 
 on:
-  workflow_dispatch: {}
   schedule:
-    - cron: "17 9 * * *" # daily 09:17 UTC
-  push:
-    branches: ["main"]
-    paths:
-      - ".github/workflows/bump.yml"
+    - cron: "17 9 * * *" # daily
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -39,13 +35,12 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install ruamel.yaml
 
-      - name: Discover latest upstream tag (git tags, not releases)
+      - name: Discover latest upstream version (tags only)
         id: upstream
         shell: bash
         run: |
           set -euo pipefail
 
-          # Sort tags by semver-ish refname ordering, pick the last vX.Y.Z style tag
           latest_tag="$(
             git ls-remote --tags --sort='v:refname' "${UPSTREAM_REPO}" \
               | awk '{print $2}' \
@@ -56,127 +51,112 @@ jobs:
           )"
 
           if [[ -z "${latest_tag}" ]]; then
-            echo "Failed to determine latest upstream tag" >&2
+            echo "Failed to determine upstream version" >&2
             exit 1
           fi
 
-          latest_ver="${latest_tag#v}"
+          echo "latest_ver=${latest_tag#v}" >> "$GITHUB_OUTPUT"
 
-          echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
-          echo "latest_ver=${latest_ver}" >> "$GITHUB_OUTPUT"
-
-      - name: Read current chart versions
-        id: current
+      - name: Update Chart.yaml (appVersion + chart patch bump)
+        id: chart
         shell: bash
+        env:
+          LATEST_APP: ${{ steps.upstream.outputs.latest_ver }}
         run: |
           set -euo pipefail
-
-          chart_file="${CHART_DIR}/Chart.yaml"
-
-          cur_app="$(
-            awk -F': ' '$1=="appVersion"{print $2; exit}' "${chart_file}" \
-              | tr -d '"' | tr -d "'"
-          )"
-          cur_chart="$(
-            awk -F': ' '$1=="version"{print $2; exit}' "${chart_file}" \
-              | tr -d '"' | tr -d "'"
-          )"
-
-          echo "cur_app=${cur_app}" >> "$GITHUB_OUTPUT"
-          echo "cur_chart=${cur_chart}" >> "$GITHUB_OUTPUT"
-
-      - name: Decide whether bump is needed
-        id: decide
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          latest="${{ steps.upstream.outputs.latest_ver }}"
-          cur="${{ steps.current.outputs.cur_app }}"
-
-          if [[ "${latest}" == "${cur}" ]]; then
-            echo "bump=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "bump=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Update Chart.yaml (appVersion + version)
-        if: steps.decide.outputs.bump == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chart_file="${CHART_DIR}/Chart.yaml"
-          latest="${{ steps.upstream.outputs.latest_ver }}"
 
           python3 - <<'PY'
-          from ruamel.yaml import YAML
-          from ruamel.yaml.scalarstring import DoubleQuotedScalarString
-          from pathlib import Path
           import os
+          from pathlib import Path
+          from ruamel.yaml import YAML
 
-          chart_file = Path(os.environ["CHART_FILE"])
-          latest = os.environ["LATEST_VER"]
+          chart_path = Path(os.environ["CHART_DIR"]) / "Chart.yaml"
+          latest_app = os.environ["LATEST_APP"]
 
           yaml = YAML()
           yaml.preserve_quotes = True
 
-          data = yaml.load(chart_file.read_text())
+          data = yaml.load(chart_path.read_text())
 
-          # Keep it simple: chart version == upstream version
-          data["appVersion"] = DoubleQuotedScalarString(latest)
-          data["version"] = DoubleQuotedScalarString(latest)
+          cur_app = str(data.get("appVersion", "")).strip()
+          cur_ver = str(data.get("version", "")).strip()
 
-          with chart_file.open("w") as f:
+          if not cur_app or not cur_ver:
+            raise SystemExit("Chart.yaml must contain appVersion and version")
+
+          def split(v):
+            return tuple(map(int, v.split(".")))
+
+          cur_app_v = split(cur_app)
+          latest_app_v = split(latest_app)
+
+          if latest_app_v[0] != cur_app_v[0]:
+            raise SystemExit(
+              f"Upstream major version change {cur_app} → {latest_app}; "
+              "chart requires manual intervention"
+            )
+
+          if latest_app == cur_app:
+            Path(os.environ["GITHUB_OUTPUT"]).write_text("changed=false\n")
+            raise SystemExit(0)
+
+          # bump chart patch version
+          major, minor, patch = map(int, cur_ver.split("."))
+          new_chart_ver = f"{major}.{minor}.{patch + 1}"
+
+          data["appVersion"] = latest_app
+          data["version"] = new_chart_ver
+
+          with chart_path.open("w") as f:
             yaml.dump(data, f)
-          PY
-        env:
-          CHART_FILE: ${{ env.CHART_DIR }}/Chart.yaml
-          LATEST_VER: ${{ steps.upstream.outputs.latest_ver }}
 
-      - name: Create or update PR branch + commit
-        if: steps.decide.outputs.bump == 'true'
+          Path(os.environ["GITHUB_OUTPUT"]).write_text(
+            "changed=true\n"
+            f"new_app={latest_app}\n"
+            f"new_chart_ver={new_chart_ver}\n"
+          )
+          PY
+
+      - name: Commit and push branch
+        if: steps.chart.outputs.changed == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          latest="${{ steps.upstream.outputs.latest_ver }}"
-          branch="${PR_BRANCH_PREFIX}-${latest}"
+          branch="${PR_BRANCH_PREFIX}-${{ steps.chart.outputs.new_app }}"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git checkout -B "${branch}" origin/main
-
           git add "${CHART_DIR}/Chart.yaml"
-          git commit -m "chore(chart): bump mosquitto to ${latest}" || {
-            echo "No changes to commit."
-            exit 0
-          }
-
+          git commit -m "chore(chart): bump mosquitto to ${{ steps.chart.outputs.new_app }}"
           git push --force-with-lease origin "${branch}"
 
           echo "BRANCH=${branch}" >> "$GITHUB_ENV"
 
-      - name: Open or update PR (and label)
-        if: steps.decide.outputs.bump == 'true'
+      - name: Open or update PR
+        if: steps.chart.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PR_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
 
-          latest="${{ steps.upstream.outputs.latest_ver }}"
           branch="${BRANCH}"
+          app="${{ steps.chart.outputs.new_app }}"
+          chart_ver="${{ steps.chart.outputs.new_chart_ver }}"
 
-          title="chore(chart): bump mosquitto to ${latest}"
-          body=$'Automated bump from upstream tags.\n\n- appVersion: '"${latest}"$'\n- chart version: '"${latest}"$'\n'
+          title="chore(chart): bump mosquitto to ${app}"
+          body=$'Automated bump from upstream tags.\n\n- appVersion: '"${app}"$'\n- chart version: '"${chart_ver}"$'\n'
 
           if gh pr view "${branch}" >/dev/null 2>&1; then
-            gh pr edit "${branch}" --title "${title}" --body "${body}" || true
+            gh pr edit "${branch}" --title "${title}" --body "${body}"
           else
             gh pr create --head "${branch}" --base main --title "${title}" --body "${body}"
           fi
 
-          gh label create "${PR_LABEL}" --color "0366d6" --description "Automated dependency updates" >/dev/null 2>&1 || true
+          gh label create "${PR_LABEL}" --color "0366d6" \
+            --description "Automated dependency updates" >/dev/null 2>&1 || true
           gh pr edit "${branch}" --add-label "${PR_LABEL}" || true
+
