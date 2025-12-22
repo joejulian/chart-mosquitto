@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
   packages: write
-  id-token: write # required for keyless cosign via GitHub OIDC
+  id-token: write
 
 concurrency:
   group: publish
@@ -50,6 +50,18 @@ jobs:
         with:
           version: v3.15.4
 
+      - name: Log in to GHCR for cosign (Docker creds)
+        if: steps.changed.outputs.version_changed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Install crane
+        if: steps.changed.outputs.version_changed == 'true'
+        uses: imjasonh/setup-crane@v0.3
+
       - name: Install cosign
         if: steps.changed.outputs.version_changed == 'true'
         uses: sigstore/cosign-installer@v3
@@ -91,15 +103,14 @@ jobs:
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
           echo "Pushed ${ref}"
 
-      - name: Cosign sign (keyless) the pushed chart
+      - name: Cosign sign (keyless, by digest)
         if: steps.changed.outputs.version_changed == 'true'
         shell: bash
-        env:
-          COSIGN_EXPERIMENTAL: "true"
         run: |
           set -euo pipefail
 
           ref="${{ steps.push.outputs.ref }}"
+          digest="$(crane digest "$ref")"
+          digref="${ref%@*}@${digest}"
 
-          # Sign by digest (cosign will resolve and record signature in the registry)
-          cosign sign --yes "${ref}"
+          cosign sign --yes "$digref"
