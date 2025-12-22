@@ -1,4 +1,4 @@
-name: Publish Helm chart to GHCR (if missing)
+name: Publish Helm chart to GHCR (if missing) + Ensure signed
 
 on:
   push:
@@ -19,6 +19,9 @@ jobs:
     env:
       CHART_DIR: chart
       GHCR_DEST: oci://ghcr.io/joejulian/charts
+      COSIGN_OIDC_ISSUER: "https://token.actions.githubusercontent.com"
+      COSIGN_IDENTITY: "https://github.com/joejulian/chart-mosquitto/.github/workflows/publish.yml@refs/heads/main"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,7 +45,7 @@ jobs:
           set -euo pipefail
           echo "${{ github.token }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Log in to GHCR for cosign/crane (Docker creds)
+      - name: Log in to GHCR for cosign/crane
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -54,30 +57,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           name="$(awk -F': ' '$1=="name"{print $2; exit}' "${CHART_DIR}/Chart.yaml" | tr -d '"' | tr -d "'")"
           ver="$(awk -F': ' '$1=="version"{print $2; exit}' "${CHART_DIR}/Chart.yaml" | tr -d '"' | tr -d "'")"
-
           dest="${GHCR_DEST#oci://}"
           ref="${dest}/${name}:${ver}"
-
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-      - name: Check whether this chart version is already published
+      - name: Check whether chart version exists
         id: exists
         shell: bash
         run: |
           set -euo pipefail
-          ref="${{ steps.ref.outputs.ref }}"
-
-          if crane manifest "$ref" >/dev/null 2>&1; then
+          if crane manifest "${{ steps.ref.outputs.ref }}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Already published: $ref"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Not published yet: $ref"
           fi
 
       - name: Package chart
@@ -87,22 +81,40 @@ jobs:
           set -euo pipefail
           helm lint "${CHART_DIR}"
           helm package "${CHART_DIR}" --destination dist
-          ls -la dist
 
-      - name: Push chart to GHCR (OCI)
+      - name: Push chart to GHCR
         if: steps.exists.outputs.exists == 'false'
         shell: bash
         run: |
           set -euo pipefail
           helm push dist/*.tgz "${GHCR_DEST}"
-          echo "Pushed ${{ steps.ref.outputs.ref }}"
 
-      - name: Cosign sign (keyless, by digest)
-        if: steps.exists.outputs.exists == 'false'
+      - name: Resolve digest
+        id: digest
         shell: bash
         run: |
           set -euo pipefail
-          ref="${{ steps.ref.outputs.ref }}"
-          digest="$(crane digest "$ref")"
-          digref="${ref%@*}@${digest}"
-          cosign sign --yes "$digref"
+          digest="$(crane digest "${{ steps.ref.outputs.ref }}")"
+          digref="${{ steps.ref.outputs.ref %@* }}@${digest}"
+          echo "digref=$digref" >> "$GITHUB_OUTPUT"
+
+      - name: Verify signature
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cosign verify \
+              --certificate-oidc-issuer "${COSIGN_OIDC_ISSUER}" \
+              --certificate-identity "${COSIGN_IDENTITY}" \
+              "${{ steps.digest.outputs.digref }}" >/dev/null 2>&1; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cosign sign (keyless)
+        if: steps.verify.outputs.signed == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${{ steps.digest.outputs.digref }}"
