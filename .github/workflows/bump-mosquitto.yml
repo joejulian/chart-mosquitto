@@ -1,15 +1,20 @@
-name: Bump Mosquitto + Chart version
+name: Bump Mosquitto version (Chart.yaml) + open/update PR
 
 on:
-  schedule:
-    - cron: "17 9 * * *" # daily; UTC
   workflow_dispatch: {}
+  schedule:
+    - cron: "17 9 * * *" # daily 09:17 UTC
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/bump.yml"
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
-  group: bump-mosquitto
+  group: bump
   cancel-in-progress: false
 
 jobs:
@@ -17,120 +22,163 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CHART_DIR: chart
+      UPSTREAM_REPO: https://github.com/eclipse-mosquitto/mosquitto.git
+      PR_BRANCH_PREFIX: bump-mosquitto
+      PR_LABEL: dependencies
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install deps
+      - name: Install python deps
+        shell: bash
         run: |
           set -euo pipefail
           python3 -m pip install --upgrade pip
           python3 -m pip install ruamel.yaml
 
-      - name: Determine latest Mosquitto release
-        id: rel
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Discover latest upstream tag (git tags, not releases)
+        id: upstream
+        shell: bash
         run: |
           set -euo pipefail
 
+          # Sort tags by semver-ish refname ordering, pick the last vX.Y.Z style tag
           latest_tag="$(
-            gh api repos/eclipse-mosquitto/mosquitto/releases/latest \
-              --jq '.tag_name'
+            git ls-remote --tags --sort='v:refname' "${UPSTREAM_REPO}" \
+              | awk '{print $2}' \
+              | sed -n 's#^refs/tags/##p' \
+              | sed 's/\^{}$//' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | tail -n 1
           )"
+
+          if [[ -z "${latest_tag}" ]]; then
+            echo "Failed to determine latest upstream tag" >&2
+            exit 1
+          fi
 
           latest_ver="${latest_tag#v}"
 
-          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
-          echo "latest_ver=$latest_ver" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+          echo "latest_ver=${latest_ver}" >> "$GITHUB_OUTPUT"
 
-      - name: Update Chart.yaml (appVersion + chart version bump)
-        id: update
-        env:
-          LATEST_APP: ${{ steps.rel.outputs.latest_ver }}
+      - name: Read current chart versions
+        id: current
+        shell: bash
         run: |
           set -euo pipefail
 
+          chart_file="${CHART_DIR}/Chart.yaml"
+
+          cur_app="$(
+            awk -F': ' '$1=="appVersion"{print $2; exit}' "${chart_file}" \
+              | tr -d '"' | tr -d "'"
+          )"
+          cur_chart="$(
+            awk -F': ' '$1=="version"{print $2; exit}' "${chart_file}" \
+              | tr -d '"' | tr -d "'"
+          )"
+
+          echo "cur_app=${cur_app}" >> "$GITHUB_OUTPUT"
+          echo "cur_chart=${cur_chart}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether bump is needed
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          latest="${{ steps.upstream.outputs.latest_ver }}"
+          cur="${{ steps.current.outputs.cur_app }}"
+
+          if [[ "${latest}" == "${cur}" ]]; then
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update Chart.yaml (appVersion + version)
+        if: steps.decide.outputs.bump == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chart_file="${CHART_DIR}/Chart.yaml"
+          latest="${{ steps.upstream.outputs.latest_ver }}"
+
           python3 - <<'PY'
-          import os, re, sys
           from ruamel.yaml import YAML
+          from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+          from pathlib import Path
+          import os
 
-          chart_dir = os.environ["CHART_DIR"]
-          chart_path = f"{chart_dir}/Chart.yaml"
-          latest_app = os.environ["LATEST_APP"].strip()
-
-          semver_re = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
-
-          def parse_semver(s: str):
-            m = semver_re.match(s)
-            if not m:
-              raise SystemExit(f"Not a plain semver X.Y.Z: {s!r}")
-            return tuple(int(x) for x in m.groups())
+          chart_file = Path(os.environ["CHART_FILE"])
+          latest = os.environ["LATEST_VER"]
 
           yaml = YAML()
           yaml.preserve_quotes = True
 
-          with open(chart_path, "r", encoding="utf-8") as f:
-            data = yaml.load(f)
+          data = yaml.load(chart_file.read_text())
 
-          cur_app = str(data.get("appVersion", "")).strip()
-          cur_chart = str(data.get("version", "")).strip()
+          # Keep it simple: chart version == upstream version
+          data["appVersion"] = DoubleQuotedScalarString(latest)
+          data["version"] = DoubleQuotedScalarString(latest)
 
-          cur_app_t = parse_semver(cur_app)
-          latest_app_t = parse_semver(latest_app)
-          cur_chart_t = parse_semver(cur_chart)
-
-          if latest_app_t == cur_app_t:
-            print("NOOP: appVersion already latest")
-            return
-
-          cur_app_major, cur_app_minor, cur_app_patch = cur_app_t
-          lat_major, lat_minor, lat_patch = latest_app_t
-
-          if lat_major != cur_app_major:
-            raise SystemExit(
-              f"Mosquitto MAJOR changed {cur_app_major} -> {lat_major}; refusing to auto-bump chart."
-            )
-
-          chart_major, chart_minor, chart_patch = cur_chart_t
-
-          if lat_minor == cur_app_minor and lat_patch > cur_app_patch:
-            # app patch bump => chart patch +1
-            chart_patch += 1
-          elif lat_minor > cur_app_minor:
-            # app minor bump => chart minor +1, reset patch
-            chart_minor += 1
-            chart_patch = 0
-          else:
-            # latest is older or weird; do nothing
-            print(f"NOOP: latest ({latest_app}) <= current ({cur_app})")
-            return
-
-          data["appVersion"] = latest_app
-          data["version"] = f"{chart_major}.{chart_minor}.{chart_patch}"
-
-          with open(chart_path, "w", encoding="utf-8") as f:
+          with chart_file.open("w") as f:
             yaml.dump(data, f)
-
-          print(f"Updated appVersion: {cur_app} -> {latest_app}")
-          print(f"Updated chart version: {cur_chart} -> {data['version']}")
           PY
+        env:
+          CHART_FILE: ${{ env.CHART_DIR }}/Chart.yaml
+          LATEST_VER: ${{ steps.upstream.outputs.latest_ver }}
 
-          if git diff --quiet -- "${CHART_DIR}/Chart.yaml"; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Commit and push
-        if: steps.update.outputs.changed == 'true'
+      - name: Create or update PR branch + commit
+        if: steps.decide.outputs.bump == 'true'
+        shell: bash
         run: |
           set -euo pipefail
+
+          latest="${{ steps.upstream.outputs.latest_ver }}"
+          branch="${PR_BRANCH_PREFIX}-${latest}"
+
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B "${branch}" origin/main
 
           git add "${CHART_DIR}/Chart.yaml"
-          git commit -m "chore(mosquitto): bump appVersion and chart version"
-          git push origin HEAD:main
+          git commit -m "chore(chart): bump mosquitto to ${latest}" || {
+            echo "No changes to commit."
+            exit 0
+          }
+
+          git push --force-with-lease origin "${branch}"
+
+          echo "BRANCH=${branch}" >> "$GITHUB_ENV"
+
+      - name: Open or update PR (and label)
+        if: steps.decide.outputs.bump == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          latest="${{ steps.upstream.outputs.latest_ver }}"
+          branch="${BRANCH}"
+
+          title="chore(chart): bump mosquitto to ${latest}"
+          body=$'Automated bump from upstream tags.\n\n- appVersion: '"${latest}"$'\n- chart version: '"${latest}"$'\n'
+
+          # Create PR if missing; otherwise update title/body
+          if gh pr view "${branch}" >/dev/null 2>&1; then
+            gh pr edit "${branch}" --title "${title}" --body "${body}" || true
+          else
+            gh pr create --head "${branch}" --base main --title "${title}" --body "${body}"
+          fi
+
+          # Ensure label exists before adding (ignore errors if it already exists / cannot create)
+          gh label create "${PR_LABEL}" --color "0366d6" --description "Automated dependency updates" >/dev/null 2>&1 || true
+          gh pr edit "${branch}" --add-label "${PR_LABEL}" || true
