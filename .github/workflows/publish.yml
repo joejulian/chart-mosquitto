@@ -94,23 +94,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          digest="$(crane digest "${{ steps.ref.outputs.ref }}")"
-          digref="${{ steps.ref.outputs.ref %@* }}@${digest}"
-          echo "digref=$digref" >> "$GITHUB_OUTPUT"
 
-      - name: Verify signature
-        id: verify
-        shell: bash
-        run: |
-          set -euo pipefail
-          if cosign verify \
-              --certificate-oidc-issuer "${COSIGN_OIDC_ISSUER}" \
-              --certificate-identity "${COSIGN_IDENTITY}" \
-              "${{ steps.digest.outputs.digref }}" >/dev/null 2>&1; then
-            echo "signed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "signed=false" >> "$GITHUB_OUTPUT"
-          fi
+          ref="${{ steps.ref.outputs.ref }}"
+          digest="$(crane digest "$ref")"
+          digref="${ref%%@*}@${digest}"
+
+          echo "digref=$digref" >> "$GITHUB_OUTPUT"
 
       - name: Cosign sign (keyless)
         if: steps.verify.outputs.signed == 'false'
